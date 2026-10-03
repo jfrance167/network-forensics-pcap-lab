@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import re
 import struct
+import unicodedata
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -15,6 +17,8 @@ from typing import Sequence
 
 
 MAX_PACKET_BYTES = 1_048_576
+MAX_CAPTURE_BYTES = 64 * 1024 * 1024
+MAX_RECORDS = 100_000
 SUSPICIOUS_DOMAINS = {"cdn-sync.example"}
 DOWNLOAD_EXTENSIONS = (".bin", ".dll", ".exe", ".ps1", ".scr")
 
@@ -103,9 +107,12 @@ def _parse_frame(frame: bytes, timestamp: datetime) -> Packet | None:
 def read_pcap(path: Path) -> tuple[Packet, ...]:
     """Read Ethernet IPv4 TCP/UDP packets from a classic PCAP."""
     try:
-        data = path.read_bytes()
+        with path.open("rb") as capture:
+            data = capture.read(MAX_CAPTURE_BYTES + 1)
     except OSError as exc:
         raise PcapError(f"unable to read {path}: {exc}") from exc
+    if len(data) > MAX_CAPTURE_BYTES:
+        raise PcapError(f"capture exceeds the {MAX_CAPTURE_BYTES // (1024 * 1024)} MiB input limit")
     if len(data) < 24:
         raise PcapError("capture is missing the global header")
     magic = data[:4]
@@ -125,7 +132,11 @@ def read_pcap(path: Path) -> tuple[Packet, ...]:
 
     packets: list[Packet] = []
     cursor = 24
+    record_count = 0
     while cursor < len(data):
+        record_count += 1
+        if record_count > MAX_RECORDS:
+            raise PcapError(f"capture exceeds the {MAX_RECORDS} record limit")
         if len(data) - cursor < 16:
             raise PcapError("truncated packet record header")
         seconds, fraction, captured, original = struct.unpack(f"{endian}IIII", data[cursor:cursor + 16])
@@ -218,12 +229,16 @@ def analyze(packets: Sequence[Packet]) -> Investigation:
 
     for (source, destination), group in transfer_groups.items():
         ordered = sorted(group, key=lambda packet: packet.timestamp)
-        for start in range(len(ordered)):
-            window = [packet for packet in ordered[start:] if (packet.timestamp - ordered[start].timestamp).total_seconds() <= 10]
-            total = sum(len(packet.payload) for packet in window)
+        right = 0
+        total = 0
+        for start, packet in enumerate(ordered):
+            while right < len(ordered) and (ordered[right].timestamp - packet.timestamp).total_seconds() <= 10:
+                total += len(ordered[right].payload)
+                right += 1
             if total >= 4096:
                 findings.append(Finding("NET-005", "high", ordered[start].timestamp, source, destination, "High-volume outbound transfer", f"payload_bytes={total}; window_seconds=10", "T1041"))
                 break
+            total -= len(packet.payload)
 
     unique_findings = {finding.rule_id: finding for finding in findings}
     ordered_findings = tuple(sorted(unique_findings.values(), key=lambda finding: (finding.timestamp, finding.rule_id)))
@@ -234,16 +249,26 @@ def analyze(packets: Sequence[Packet]) -> Investigation:
 
 
 def _cell(value: object) -> str:
-    return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    text = "".join(
+        " " if unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} else char
+        for char in str(value)
+    )
+    text = re.sub(r"(?i)https?://", lambda match: "hxxps://" if match.group(0).lower() == "https://" else "hxxp://", text)
+    text = re.sub(r"(?i)\b(?!hxxps?)([a-z][a-z0-9+.-]*):(?=//|[a-z])", r"\1[:]", text)
+    text = text.replace(".", "[.]")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for char in "\\`*_{}[]()#!|<>":
+        text = text.replace(char, "\\" + char)
+    return text
 
 
 def render_markdown(investigation: Investigation, source: str) -> str:
     lines = [
         "# Network Forensics Investigation Report",
         "",
-        f"- Evidence: `{source}`",
+        f"- Evidence: {_cell(source)}",
         f"- Packets analyzed: **{investigation.packet_count}**",
-        f"- Incident severity: **{investigation.severity.upper()}**",
+        f"- Incident severity: **{_cell(investigation.severity.upper())}**",
         f"- Findings: **{len(investigation.findings)}**",
         "",
         "## Timeline",
@@ -258,9 +283,9 @@ def render_markdown(investigation: Investigation, source: str) -> str:
         )) + " |")
     lines.extend([
         "", "## Indicators", "",
-        f"- Internal hosts: {', '.join(investigation.internal_hosts) or 'None'}",
-        f"- External hosts: {', '.join(investigation.external_hosts) or 'None'}",
-        f"- Queried domains: {', '.join(investigation.domains) or 'None'}",
+        f"- Internal hosts: {', '.join(_cell(value) for value in investigation.internal_hosts) or 'None'}",
+        f"- External hosts: {', '.join(_cell(value) for value in investigation.external_hosts) or 'None'}",
+        f"- Queried domains: {', '.join(_cell(value) for value in investigation.domains) or 'None'}",
         "", "## Recommended Response", "",
         "1. Isolate the affected workstation while preserving volatile evidence.",
         "2. Block confirmed malicious destinations and domains after validation.",
